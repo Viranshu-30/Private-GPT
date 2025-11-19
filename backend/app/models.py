@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Column, Integer, String, DateTime, func,
-    Boolean, ForeignKey, UniqueConstraint
+    Boolean, ForeignKey, UniqueConstraint, Text
 )
 from .database import Base
 
@@ -10,6 +10,8 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
     is_active = Column(Boolean, default=True)
+    # ✅ NEW: Store user's encrypted OpenAI API key
+    encrypted_api_key = Column(Text, nullable=True)  # Encrypted storage for security
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 # ---- Projects & Memberships ----
@@ -38,15 +40,18 @@ class Thread(Base):
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True, index=True)
     session_id = Column(String, unique=True, index=True, nullable=False)
     group_scope = Column(String, nullable=False)
+    active_model = Column(String, default="gpt-4o-mini")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     last_message_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
 
 class Message(Base):
     __tablename__ = "messages"
     id = Column(Integer, primary_key=True)
     thread_id = Column(Integer, ForeignKey("threads.id", ondelete="CASCADE"), index=True, nullable=False)
-    sender = Column(String, nullable=False)      # "user" or "assistant"
+    sender = Column(String, nullable=False)
     content = Column(String, nullable=True)
-    type = Column(String, default="text")        # "text" | "file"
+    type = Column(String, default="text")
     filename = Column(String, nullable=True)
+    model_used = Column(String, default="gpt-4o-mini")
     created_at = Column(DateTime(timezone=True), server_default=func.now())

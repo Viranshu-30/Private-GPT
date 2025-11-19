@@ -8,3 +8,30 @@ body {
   @apply bg-neutral-900 text-neutral-100;
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica Neue, Arial, "Apple Color Emoji", "Segoe UI Emoji";
 }
+
+/* Markdown content styling */
+.markdown-content {
+  @apply text-neutral-100;
+}
+
+.markdown-content pre {
+  @apply overflow-x-auto;
+}
+
+.markdown-content code {
+  @apply font-mono text-sm;
+}
+
+.markdown-content pre code {
+  @apply block;
+}
+
+/* Code block styling */
+.markdown-content .hljs {
+  @apply bg-neutral-900 !important;
+}
+
+/* Ensure code blocks are readable */
+.markdown-content pre[class*="language-"] {
+  @apply bg-neutral-900 border border-neutral-700;
+}

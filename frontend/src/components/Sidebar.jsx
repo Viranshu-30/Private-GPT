@@ -13,7 +13,7 @@ export default function Sidebar({
   const [personalThreads, setPersonalThreads] = useState([]);
   const [expanded, setExpanded] = useState({});
 
-  // Load projects + personal threads
+  // Load all projects and personal threads
   const load = async () => {
     try {
       const [proj, personal] = await Promise.all([
@@ -29,9 +29,14 @@ export default function Sidebar({
 
   useEffect(() => {
     load();
+
+    // Auto-refresh when Chat dispatches "refresh-threads"
+    const handler = () => load();
+    window.addEventListener('refresh-threads', handler);
+    return () => window.removeEventListener('refresh-threads', handler);
   }, []);
 
-  // Load threads for a specific project
+  // Load threads belonging to a specific project
   const loadProjectThreads = async (projectId) => {
     try {
       const res = await api.get('/threads', { params: { project_id: projectId } });
@@ -46,7 +51,10 @@ export default function Sidebar({
       {/* Header */}
       <div className="p-3 border-b border-neutral-800 flex items-center justify-between">
         <div className="font-semibold text-lg">Workspace</div>
-        <button className="text-xs px-2 py-1 bg-neutral-800 rounded" onClick={load}>
+        <button
+          className="text-xs px-2 py-1 bg-neutral-800 rounded"
+          onClick={load}
+        >
           ↻
         </button>
       </div>
@@ -59,11 +67,12 @@ export default function Sidebar({
             <div className="text-xs uppercase opacity-70">My Chats</div>
             <button
               className="text-xs px-2 py-1 bg-blue-600 rounded"
-              onClick={onNewPersonal}
+              onClick={() => onNewPersonal()}
             >
               New
             </button>
           </div>
+
           <div className="mt-2 space-y-1">
             {personalThreads.map((t) => (
               <div
@@ -76,10 +85,16 @@ export default function Sidebar({
                   onClick={() => onSelectThread(t)}
                   className="flex-1 text-left truncate"
                 >
-                  {t.title}
+                  <div>{t.title}</div>
+                  {/* Show model currently active for this chat */}
+                  {t.active_model && (
+                    <div className="text-xs opacity-60">
+                      model: {t.active_model}
+                    </div>
+                  )}
                 </button>
 
-                {/* Rename button */}
+                {/* Rename chat */}
                 <button
                   className="text-xs px-1 text-blue-400 hover:text-blue-300"
                   onClick={async (e) => {
@@ -95,7 +110,7 @@ export default function Sidebar({
                   ✏️
                 </button>
 
-                {/* Delete button */}
+                {/* Delete chat */}
                 <button
                   className="text-xs px-1 text-red-400 hover:text-red-300"
                   onClick={async (e) => {
@@ -169,7 +184,12 @@ export default function Sidebar({
                         onClick={() => onSelectThread(t)}
                         className="flex-1 text-left truncate"
                       >
-                        {t.title}
+                        <div>{t.title}</div>
+                        {t.active_model && (
+                          <div className="text-xs opacity-60">
+                            model: {t.active_model}
+                          </div>
+                        )}
                       </button>
 
                       {/* Rename chat */}

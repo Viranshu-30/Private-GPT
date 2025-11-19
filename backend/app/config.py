@@ -1,7 +1,6 @@
-
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import AnyHttpUrl
-from typing import List
+from typing import List, Optional
 import os
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), "../.env"))
@@ -17,6 +16,9 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./app.db"
 
     openai_api_key: str
+
+    # ✅ NEW: Tavily API configuration
+    tavily_api_key: Optional[str] = None
 
     memmachine_base_url: str = "http://localhost:8080"
     memmachine_group_prefix: str = "group"
