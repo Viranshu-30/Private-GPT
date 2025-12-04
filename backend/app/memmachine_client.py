@@ -1,204 +1,464 @@
 """
-MemMachine client - Enhanced version with cross-thread memory support.
-Uses /v1/memories endpoint to store in BOTH episodic and profile memory.
+MemMachine V2 Client - Hybrid Architecture
+Supports both personal (user-level) and project-level (team) memory organization.
+
+KEY CHANGES FROM V1:
+- profile_memory → semantic_memory
+- New project-based organization
+- Hybrid approach: personal threads use user org, project threads use shared org
+- Uses /v2/memories endpoint for unified storage
 """
 import requests
 import logging
 from typing import Optional, Dict, Any, List
 from app.config import settings
 
-# Set up logging
 logger = logging.getLogger(__name__)
 
+# MemMachine V2 Configuration
 BASE = settings.memmachine_base_url
-GROUP_PREFIX = settings.memmachine_group_prefix
-AGENT_ID = settings.memmachine_agent_id
+APP_ORG_ID = "privategpt"  # Shared org for team projects
 
 
-def _session_payload(group_scope: str, user_id: str, session_id: Optional[str] = None):
+def _get_org_and_project(user_id: int, project_id: Optional[int] = None) -> tuple[str, str]:
     """
-    Build session payload for MemMachine.
+    Determine org_id and project_id based on context.
     
-    CRITICAL: session_id is optional!
-    - When storing: Include session_id to tag which thread the memory belongs to
-    - When searching: Omit session_id (pass None) to search across ALL threads
+    HYBRID ARCHITECTURE:
+    - Personal threads: org_id = "user-{id}", project_id = "personal"
+    - Team projects: org_id = "privategpt", project_id = "proj-{id}"
+    
+    Args:
+        user_id: User ID
+        project_id: Optional project ID (if None, assumes personal)
+    
+    Returns:
+        Tuple of (org_id, mm_project_id)
     """
-    payload = {
-        "group_id": f"{GROUP_PREFIX}-{group_scope}",
-        "agent_id": [AGENT_ID] if AGENT_ID else [],
-        "user_id": [str(user_id)],
-    }
-    
-    # Only add session_id if explicitly provided (not None)
-    if session_id is not None:
-        payload["session_id"] = session_id
-    
-    logger.debug(f"Session payload: {payload}")
-    return payload
+    if project_id is None:
+        # Personal scope: user's own org
+        return f"user-{user_id}", "personal"
+    else:
+        # Team scope: shared org
+        return APP_ORG_ID, f"proj-{project_id}"
 
 
-def add_memory(
-    group_scope: str,
-    user_id: str,
-    content: str,
-    episode_type: str = "message",
-    metadata: Optional[Dict[str, Any]] = None,
-    session_id: Optional[str] = None,
-    related_episodes: Optional[List[str]] = None,
-):
+def ensure_project_exists(user_id: int, project_id: Optional[int] = None) -> bool:
     """
-    Add memory to BOTH episodic AND profile storage.
-    Uses /v1/memories endpoint per official documentation.
+    Ensure a project exists in MemMachine V2.
+    Creates if it doesn't exist.
+    
+    Args:
+        user_id: User ID
+        project_id: Optional project ID
+    
+    Returns:
+        bool: Success status
     """
-    meta = metadata or {}
-    
-    if related_episodes:
-        meta["related_to"] = related_episodes
-        meta["has_context"] = True
-    
-    payload = {
-        "session": _session_payload(group_scope, user_id, session_id or "default"),
-        "producer": AGENT_ID or "system",
-        "produced_for": str(user_id),
-        "episode_content": content,
-        "episode_type": episode_type,
-        "metadata": meta,
-    }
+    org_id, mm_project_id = _get_org_and_project(user_id, project_id)
     
     try:
-        logger.info(f"Adding memory: type={episode_type}, session={session_id}, content_len={len(content)}")
-        r = requests.post(f"{BASE}/v1/memories", json=payload, timeout=10)
-        r.raise_for_status()
-        logger.info(f"Memory added successfully")
+        # Check if project exists
+        response = requests.post(
+            f"{BASE}/api/v2/projects/get",
+            json={"org_id": org_id, "project_id": mm_project_id},
+            timeout=5
+        )
+        
+        if response.status_code == 200:
+            return True
+        
+        # Project doesn't exist, create it
+        project_name = f"Personal Chat - User {user_id}" if project_id is None else f"Project {project_id}"
+        
+        create_response = requests.post(
+            f"{BASE}/api/v2/projects",
+            json={
+                "org_id": org_id,
+                "project_id": mm_project_id,
+                "name": project_name,
+                "description": f"Memory space for {project_name}"
+            },
+            timeout=5
+        )
+        create_response.raise_for_status()
+        
+        logger.info(f"✅ Created project: org={org_id}, project={mm_project_id}")
         return True
+        
     except Exception as e:
-        logger.error(f"Failed to add memory: {e}")
+        logger.error(f"❌ Failed to ensure project exists: {e}")
         return False
 
 
-def add_episodic(
-    group_scope: str,
-    user_id: str,
+def add_memory(
+    user_id: int,
     content: str,
-    episode_type: str = "message",
-    metadata: Optional[Dict[str, Any]] = None,
-    session_id: Optional[str] = None,
-    related_episodes: Optional[List[str]] = None,
-):
-    """Add to both memories using unified endpoint."""
-    return add_memory(group_scope, user_id, content, episode_type, metadata, session_id, related_episodes)
-
-
-def add_profile(
-    group_scope: str,
-    user_id: str,
-    content: str,
-    profile_type: str = "user_info",
-    metadata: Optional[Dict[str, Any]] = None,
-    session_id: Optional[str] = None,
-):
-    """Add to both memories using unified endpoint."""
-    return add_memory(group_scope, user_id, content, profile_type, metadata, session_id)
-
-
-def search(
-    group_scope: str,
-    user_id: str,
-    query: str,
-    limit: int = 100,
-    session_id: Optional[str] = None,
-):
+    thread_id: int,
+    project_id: Optional[int] = None,
+    role: str = "user",
+    metadata: Optional[Dict] = None,
+    store_as_semantic: bool = False
+) -> bool:
     """
-    Search memories across both episodic and profile storage.
+    Add episodic memory to MemMachine V2.
+    Used for conversation messages and interactions.
     
-    CRITICAL: When session_id is None, searches across ALL sessions for the user.
-    This enables cross-thread memory recall!
+    Args:
+        user_id: User ID
+        content: Message content
+        thread_id: Thread/conversation ID
+        project_id: Optional project ID
+        role: Message role (user/assistant)
+        metadata: Additional metadata
+        store_as_semantic: If True, also store in semantic memory
+    
+    Returns:
+        bool: Success status
     """
+    org_id, mm_project_id = _get_org_and_project(user_id, project_id)
+    
+    # Ensure project exists
+    ensure_project_exists(user_id, project_id)
+    
+    # Build metadata - convert all values to strings (V2 requirement)
+    meta = metadata or {}
+    meta.update({
+        "thread_id": str(thread_id),
+        "user_id": str(user_id),
+        "role": role,
+        "source": "privategpt"
+    })
+    
+    if project_id:
+        meta["project_id"] = str(project_id)
+        meta["shared"] = "true"
+    
+    # Convert any integer values in metadata to strings (V2 requirement)
+    for key, value in list(meta.items()):
+        if isinstance(value, (int, bool)):
+            meta[key] = str(value).lower() if isinstance(value, bool) else str(value)
+    
+    # Build message payload for V2 API
+    message = {
+        "content": content,
+        "producer": "user" if role == "user" else "assistant",
+        "produced_for": f"ai-thread-{thread_id}",
+        "role": role,
+        "metadata": meta
+    }
+    
+    # V2 payload structure
     payload = {
-        "session": _session_payload(group_scope, user_id, session_id),
-        "query": query or "",
-        "filter": {},
-        "limit": limit,
+        "org_id": org_id,
+        "project_id": mm_project_id,
+        "messages": [message]
     }
     
     try:
-        logger.info(f"Searching memories: query='{query[:50]}...', session_id={session_id}, limit={limit}")
-        r = requests.post(f"{BASE}/v1/memories/search", json=payload, timeout=60)
-        r.raise_for_status()
+        # Store using V2 unified endpoint
+        response = requests.post(
+            f"{BASE}/api/v2/memories",
+            json=payload,
+            timeout=10
+        )
+        response.raise_for_status()
         
-        result = r.json()
+        # If semantic storage requested, store in semantic memory too
+        if store_as_semantic:
+            add_semantic_memory(user_id, content, project_id, meta)
         
-        if isinstance(result, str):
-            import json
-            result = json.loads(result)
-        
-        content = result.get("content", {})
-        
-        # Handle nested array structure
-        episodic_nested = content.get("episodic_memory", []) or []
-        profile_nested = content.get("profile_memory", []) or []
-        
-        logger.debug(f"Raw episodic results: {type(episodic_nested)}, {len(episodic_nested) if isinstance(episodic_nested, list) else 'not a list'}")
-        logger.debug(f"Raw profile results: {type(profile_nested)}, {len(profile_nested) if isinstance(profile_nested, list) else 'not a list'}")
-        
-        # Flatten arrays
-        episodic = []
-        if isinstance(episodic_nested, list):
-            for group in episodic_nested:
-                if isinstance(group, list):
-                    episodic.extend(group)
-                elif isinstance(group, dict):
-                    episodic.append(group)
-        
-        profile = []
-        if isinstance(profile_nested, list):
-            for group in profile_nested:
-                if isinstance(group, list):
-                    profile.extend(group)
-                elif isinstance(group, dict):
-                    profile.append(group)
-        
-        # Convert to standard format
-        episodic_results = []
-        for item in episodic:
-            if isinstance(item, dict):
-                content_text = item.get("content", "")
-                if content_text:  # Only add non-empty content
-                    episodic_results.append({
-                        "episode_content": content_text,
-                        "metadata": item.get("user_metadata", {}),
-                        "episode_type": item.get("episode_type", ""),
-                    })
-        
-        profile_results = []
-        for item in profile:
-            if isinstance(item, dict):
-                content_text = item.get("content", "")
-                if content_text:  # Only add non-empty content
-                    profile_results.append({
-                        "profile_content": content_text,
-                        "metadata": item.get("user_metadata", {}),
-                        "profile_type": item.get("episode_type", ""),
-                    })
-        
-        logger.info(f"Search results: {len(episodic_results)} episodic, {len(profile_results)} profile")
-        
-        # Debug: Print first few results
-        if episodic_results:
-            logger.debug(f"First episodic: {episodic_results[0]['episode_content'][:100]}...")
-        if profile_results:
-            logger.debug(f"First profile: {profile_results[0]['profile_content'][:100]}...")
-        
-        return {
-            "episodic_results": episodic_results,
-            "profile_results": profile_results,
-            "total": len(episodic_results) + len(profile_results)
-        }
+        return True
         
     except Exception as e:
-        logger.error(f"Memory search failed: {e}")
-        return {
-            "episodic_results": [],
-            "profile_results": [],
-            "total": 0
+        logger.error(f"❌ Failed to store memory: {e}")
+        return False
+
+
+def add_semantic_memory(
+    user_id: int,
+    content: str,
+    project_id: Optional[int] = None,
+    metadata: Optional[Dict] = None
+) -> bool:
+    """
+    Add semantic (long-term) memory to MemMachine V2.
+    Used for:
+    - Document content
+    - Project guidelines
+    - User preferences
+    - Long-term knowledge
+    
+    Args:
+        user_id: User ID
+        content: Semantic content
+        project_id: Optional project ID
+        metadata: Additional metadata
+    
+    Returns:
+        bool: Success status
+    """
+    org_id, mm_project_id = _get_org_and_project(user_id, project_id)
+    
+    # Ensure project exists
+    ensure_project_exists(user_id, project_id)
+    
+    # Build metadata - convert all values to strings (V2 requirement)
+    meta = metadata or {}
+    
+    # Convert all metadata values to strings (V2 requirement)
+    meta.update({
+        "user_id": str(user_id),
+        "type": "semantic",
+        "source": "privategpt"
+    })
+    
+    if project_id:
+        meta["project_id"] = str(project_id)
+        meta["shared"] = "true"
+    
+    # Add thread_id if present in metadata
+    if "thread_id" in meta:
+        meta["thread_id"] = str(meta["thread_id"])
+    
+    # Convert any other integer values to strings
+    for key, value in meta.items():
+        if isinstance(value, int):
+            meta[key] = str(value)
+    
+    # Build semantic message
+    message = {
+        "content": content,
+        "producer": "system",
+        "produced_for": f"semantic-{user_id}",
+        "role": "semantic",
+        "metadata": meta
+    }
+    
+    # V2 payload
+    payload = {
+        "org_id": org_id,
+        "project_id": mm_project_id,
+        "messages": [message]
+    }
+    
+    try:
+        # Use semantic-specific endpoint
+        response = requests.post(
+            f"{BASE}/api/v2/memories/semantic/add",
+            json=payload,
+            timeout=10
+        )
+        response.raise_for_status()
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to store semantic memory: {e}")
+        return False
+
+
+def search_memories(
+    user_id: int,
+    query: str,
+    project_id: Optional[int] = None,
+    thread_id: Optional[int] = None,
+    limit: int = 20,
+    search_semantic: bool = True,
+    search_episodic: bool = True
+) -> Dict[str, Any]:
+    """
+    Search memories in MemMachine V2 with cross-thread support.
+    
+    CROSS-THREAD SEARCH:
+    - If thread_id is None: Searches ALL threads in the scope
+    - If thread_id is provided: Optionally filter by thread in post-processing
+    
+    Args:
+        user_id: User ID
+        query: Search query
+        project_id: Optional project ID (changes search scope)
+        thread_id: Optional thread ID (for filtering, not API-level restriction)
+        limit: Max results to return
+        search_semantic: Include semantic memories
+        search_episodic: Include episodic memories
+    
+    Returns:
+        Dict with episodic_results and semantic_results
+    """
+    org_id, mm_project_id = _get_org_and_project(user_id, project_id)
+    
+    results = {
+        "episodic_results": [],
+        "semantic_results": [],
+        "total": 0
+    }
+    
+    try:
+        # Build search types
+        types = []
+        if search_semantic:
+            types.append("semantic")
+        if search_episodic:
+            types.append("episodic")
+        
+        if not types:
+            return results
+        
+        # V2 search payload
+        payload = {
+            "org_id": org_id,
+            "project_id": mm_project_id,
+            "query": query,
+            "top_k": limit,
+            "types": types,
+            "filter": "",
+            "group_by": None,
+            "rerank": True,
+            "include_metadata": True
         }
+        
+        response = requests.post(
+            f"{BASE}/api/v2/memories/search",
+            json=payload,
+            timeout=60
+        )
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        # Parse V2 response format
+        if isinstance(data, dict):
+            content = data.get("content", {})
+            
+            # Extract episodic memories (V2 structure: episodic_memory with nested episodes)
+            if "episodic_memory" in content:
+                episodic_data = content["episodic_memory"]
+                
+                # V2 has both long_term_memory and short_term_memory
+                all_episodes = []
+                
+                if isinstance(episodic_data, dict):
+                    # Get long-term memory episodes
+                    if "long_term_memory" in episodic_data:
+                        ltm = episodic_data["long_term_memory"]
+                        if isinstance(ltm, dict) and "episodes" in ltm:
+                            all_episodes.extend(ltm["episodes"])
+                    
+                    # Get short-term memory episodes
+                    if "short_term_memory" in episodic_data:
+                        stm = episodic_data["short_term_memory"]
+                        if isinstance(stm, dict) and "episodes" in stm:
+                            all_episodes.extend(stm["episodes"])
+                
+                # Parse episodes
+                for episode in all_episodes:
+                    if isinstance(episode, dict) and "content" in episode:
+                        memory_item = {
+                            "episode_content": episode["content"],
+                            "metadata": episode.get("metadata", {}),
+                            "episode_type": episode.get("episode_type", "message"),
+                            "score": episode.get("score", 1.0),
+                            "created_at": episode.get("created_at", "")
+                        }
+                        
+                        # Filter by thread_id if specified (client-side filtering)
+                        if thread_id:
+                            item_thread_id = memory_item["metadata"].get("thread_id")
+                            if item_thread_id and str(item_thread_id) == str(thread_id):
+                                results["episodic_results"].append(memory_item)
+                        else:
+                            # No thread filter - include all (cross-thread search)
+                            results["episodic_results"].append(memory_item)
+            
+            # Extract semantic memories (V2 structure: semantic_memory array with "value" field)
+            if "semantic_memory" in content:
+                semantic_data = content["semantic_memory"]
+                if isinstance(semantic_data, list):
+                    for item in semantic_data:
+                        if isinstance(item, dict) and "value" in item:
+                            memory_item = {
+                                "profile_content": item["value"],
+                                "metadata": item.get("metadata", {}),
+                                "profile_type": item.get("category", "profile"),
+                                "feature_name": item.get("feature_name", ""),
+                                "tag": item.get("tag", ""),
+                                "score": 1.0
+                            }
+                            results["semantic_results"].append(memory_item)
+        
+        results["total"] = len(results["episodic_results"]) + len(results["semantic_results"])
+        
+        return results
+        
+    except Exception as e:
+        logger.error(f"❌ Memory search failed: {e}")
+        return results
+
+
+def get_project_episode_count(
+    user_id: int,
+    project_id: Optional[int] = None
+) -> int:
+    """
+    Get episode count for a project in MemMachine V2.
+    
+    Args:
+        user_id: User ID
+        project_id: Optional project ID
+    
+    Returns:
+        int: Number of episodes
+    """
+    org_id, mm_project_id = _get_org_and_project(user_id, project_id)
+    
+    try:
+        response = requests.post(
+            f"{BASE}/api/v2/projects/get",
+            json={"org_id": org_id, "project_id": mm_project_id},
+            timeout=5
+        )
+        response.raise_for_status()
+        
+        data = response.json()
+        if isinstance(data, dict):
+            content = data.get("content", {})
+            return content.get("episode_count", 0)
+        
+        return 0
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to get episode count: {e}")
+        return 0
+
+
+def delete_project_memories(
+    user_id: int,
+    project_id: Optional[int] = None
+) -> bool:
+    """
+    Delete all memories for a project in MemMachine V2.
+    
+    Args:
+        user_id: User ID
+        project_id: Optional project ID
+    
+    Returns:
+        bool: Success status
+    """
+    org_id, mm_project_id = _get_org_and_project(user_id, project_id)
+    
+    try:
+        response = requests.delete(
+            f"{BASE}/api/v2/projects",
+            json={"org_id": org_id, "project_id": mm_project_id},
+            timeout=10
+        )
+        response.raise_for_status()
+        
+        logger.info(f"✅ Deleted project: org={org_id}, project={mm_project_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to delete project: {e}")
+        return False

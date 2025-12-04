@@ -1,17 +1,30 @@
-from datetime import datetime, timedelta, timezone
+"""
+Enhanced auth.py with multi-provider API key management.
+Supports OpenAI, Anthropic Claude, Google Gemini, and Tavily.
+✅ UPDATED FOR MEMMACHINE V2
+"""
+from datetime import datetime, timedelta, timezone  
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
 import jwt
+from typing import Optional, Dict, Any
+from uuid import uuid4
+import logging
 
 from .config import settings
 from .database import SessionLocal, Base, engine
-from .models import User
-from .schemas import UserCreate, UserOut, Token, UserUpdateApiKey
-from .utils.encryption import encrypt_api_key, decrypt_api_key, validate_openai_api_key
+from .models import User, Thread
+from .schemas import UserCreate, UserOut, Token
+from .utils.encryption import (
+    encrypt_api_key, decrypt_api_key,
+    validate_openai_api_key, validate_anthropic_api_key,
+    validate_google_api_key, validate_tavily_api_key
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
@@ -19,120 +32,220 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 # Create tables
 Base.metadata.create_all(bind=engine)
 
+
+# ============================================================================
+# DATABASE & PASSWORD UTILITIES
+# ============================================================================
+
 def get_db():
+    """Database session dependency"""
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
+
 def get_password_hash(password: str) -> str:
+    """Hash password using bcrypt"""
     return pwd_context.hash(password)
 
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify password against hash"""
     return pwd_context.verify(plain_password, hashed_password)
 
+
+# ============================================================================
+# JWT TOKEN MANAGEMENT
+# ============================================================================
+
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
+    """Create JWT access token"""
     to_encode = data.copy()
-    expire = datetime.now(tz=timezone.utc) + (expires_delta or timedelta(minutes=settings.access_token_expire_minutes))
+    expire = datetime.now(tz=timezone.utc) + (
+        expires_delta or timedelta(minutes=settings.access_token_expire_minutes)
+    )
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, settings.secret_key, algorithm="HS256")
     return encoded_jwt
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+
+def get_current_user(
+    token: str = Depends(oauth2_scheme), 
+    db: Session = Depends(get_db)
+) -> User:
+    """Get current authenticated user from JWT token"""
     try:
         payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
         user_id: int = int(payload.get("sub"))
     except Exception:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token"
+        )
+    
     user = db.query(User).filter(User.id == user_id).first()
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
+    
     return user
 
 
-def get_user_api_key(user: User) -> str:
+# ============================================================================
+# API KEY MANAGEMENT
+# ============================================================================
+
+def get_user_api_keys(user: User) -> Dict[str, Optional[str]]:
     """
-    Get decrypted API key for user.
-    Falls back to system API key if user hasn't set one.
-    """
-    if user.encrypted_api_key:
-        try:
-            return decrypt_api_key(user.encrypted_api_key)
-        except Exception as e:
-            print(f"Failed to decrypt user API key: {e}")
-            # Fall back to system key
-            return settings.openai_api_key if settings.openai_api_key else None
+    Get all decrypted API keys for user.
+    Returns dict with provider names as keys.
     
-    # Fall back to system API key (backward compatibility)
-    return settings.openai_api_key if settings.openai_api_key else None
+    Handles both old single-key and new multi-provider formats for backward compatibility.
+    """
+    keys = {}
+    
+    # OpenAI - check both new and old field names
+    if hasattr(user, 'encrypted_openai_key') and user.encrypted_openai_key:
+        try:
+            keys['openai'] = decrypt_api_key(user.encrypted_openai_key)
+        except Exception as e:
+            logger.error(f"Failed to decrypt OpenAI key: {e}")
+            keys['openai'] = None
+    elif hasattr(user, 'encrypted_api_key') and user.encrypted_api_key:
+        # Backward compatibility with old single key
+        try:
+            keys['openai'] = decrypt_api_key(user.encrypted_api_key)
+        except Exception as e:
+            logger.error(f"Failed to decrypt API key: {e}")
+            keys['openai'] = None
+    else:
+        keys['openai'] = None
+    
+    # Anthropic
+    if hasattr(user, 'encrypted_anthropic_key') and user.encrypted_anthropic_key:
+        try:
+            keys['anthropic'] = decrypt_api_key(user.encrypted_anthropic_key)
+        except Exception as e:
+            logger.error(f"Failed to decrypt Anthropic key: {e}")
+            keys['anthropic'] = None
+    else:
+        keys['anthropic'] = None
+    
+    # Google
+    if hasattr(user, 'encrypted_google_key') and user.encrypted_google_key:
+        try:
+            keys['google'] = decrypt_api_key(user.encrypted_google_key)
+        except Exception as e:
+            logger.error(f"Failed to decrypt Google key: {e}")
+            keys['google'] = None
+    else:
+        keys['google'] = None
+    
+    # Tavily
+    if hasattr(user, 'encrypted_tavily_key') and user.encrypted_tavily_key:
+        try:
+            keys['tavily'] = decrypt_api_key(user.encrypted_tavily_key)
+        except Exception as e:
+            logger.error(f"Failed to decrypt Tavily key: {e}")
+            keys['tavily'] = None
+    else:
+        keys['tavily'] = None
+    
+    return keys
 
 
-from uuid import uuid4
-from .models import Thread
+def get_user_api_key(user: User, provider: str = 'openai') -> Optional[str]:
+    """
+    Get decrypted API key for specific provider.
+    Backward compatible with old single-key system.
+    
+    Args:
+        user: User object
+        provider: Provider name ('openai', 'anthropic', 'google', 'tavily')
+    
+    Returns:
+        Decrypted API key or None
+    """
+    keys = get_user_api_keys(user)
+    return keys.get(provider.lower())
+
+
+def has_any_provider_key(user: User) -> bool:
+    """Check if user has at least one provider API key configured"""
+    # Check new format
+    if hasattr(user, 'encrypted_openai_key'):
+        return any([
+            user.encrypted_openai_key,
+            getattr(user, 'encrypted_anthropic_key', None),
+            getattr(user, 'encrypted_google_key', None)
+        ])
+    # Check old format (backward compatibility)
+    return bool(getattr(user, 'encrypted_api_key', None))
+
+
+# ============================================================================
+# AUTHENTICATION ENDPOINTS
+# ============================================================================
 
 @router.post("/signup", response_model=UserOut)
-def signup(payload: UserCreate, db: Session = Depends(get_db)):
+def signup(user_data: UserCreate, db: Session = Depends(get_db)):
     """
-    Sign up a new user with their OpenAI API key.
+    Register new user.
+    API keys can be added later in settings via the just-in-time flow.
+    Accepts optional location data from geolocation.
     """
-    # Check if user already exists
-    existing = db.query(User).filter(User.email == payload.email).first()
+    # Check if user exists
+    existing = db.query(User).filter(User.email == user_data.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
-
-    # Validate API key format
-    if not validate_openai_api_key(payload.openai_api_key):
-        raise HTTPException(
-            status_code=400, 
-            detail="Invalid OpenAI API key format. Key should start with 'sk-' and be at least 20 characters long."
-        )
-
-    # Encrypt API key for secure storage
-    try:
-        encrypted_key = encrypt_api_key(payload.openai_api_key)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to process API key")
-
-    # Create user with encrypted API key
+    
     user = User(
-        email=payload.email, 
-        hashed_password=get_password_hash(payload.password),
-        encrypted_api_key=encrypted_key
+        email=user_data.email,
+        hashed_password=get_password_hash(user_data.password),
+        name=user_data.name,
+        occupation=user_data.occupation,
+        location_city=user_data.location_city,
+        location_state=user_data.location_state,
+        location_country=user_data.location_country,
+        location_latitude=user_data.location_latitude,
+        location_longitude=user_data.location_longitude,
+        location_timezone=user_data.location_timezone,
+        location_formatted=user_data.location_formatted,
+        location_updated_at=datetime.utcnow() if user_data.location_city else None,
     )
+    
     db.add(user)
     db.commit()
     db.refresh(user)
-
-    # Create initial personal thread
-    personal_thread = Thread(
-        title="Personal Chat",
-        owner_user_id=user.id,
-        project_id=None,
-        session_id=f"t-{uuid4().hex[:12]}",
-        group_scope=f"user-{user.id}",
-    )
-    db.add(personal_thread)
-    db.commit()
-
+    
+    logger.info(f"✅ New user registered: {user.email}")
+    
     return UserOut(
         id=user.id,
         email=user.email,
-        has_api_key=True
+        has_openai_key=False,  # No keys at signup!
+        has_anthropic_key=False,
+        has_google_key=False,
+        has_tavily_key=False,
     )
 
 
 @router.post("/login", response_model=Token)
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
+    """
+    Login with email and password.
+    User can add API keys later via just-in-time flow.
+    """
     user = db.query(User).filter(User.email == form_data.username).first()
-    if not user or not verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(status_code=400, detail="Incorrect email or password")
     
-    # Check if user has API key configured
-    if not user.encrypted_api_key:
+    if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
-            status_code=400, 
-            detail="No API key configured. Please contact support or re-register with an API key."
+            status_code=400,
+            detail="Incorrect email or password"
         )
     
     token = create_access_token({"sub": str(user.id)})
@@ -140,71 +253,235 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 
 
 @router.get("/me", response_model=UserOut)
-def me(current_user: User = Depends(get_current_user)):
+def get_current_user_info(current_user: User = Depends(get_current_user)):
+    """Get current user information"""
     return UserOut(
         id=current_user.id,
         email=current_user.email,
-        has_api_key=bool(current_user.encrypted_api_key)
+        has_openai_key=bool(
+            getattr(current_user, 'encrypted_openai_key', None) or 
+            getattr(current_user, 'encrypted_api_key', None)
+        ),
+        has_anthropic_key=bool(getattr(current_user, 'encrypted_anthropic_key', None)),
+        has_google_key=bool(getattr(current_user, 'encrypted_google_key', None)),
+        has_tavily_key=bool(getattr(current_user, 'encrypted_tavily_key', None))
     )
 
 
+# ============================================================================
+# API KEY MANAGEMENT ENDPOINTS
+# ============================================================================
+
+@router.put("/api-keys")
+def update_api_keys(
+    payload: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Update user's API keys.
+    Can update any combination of keys.
+    Accepts: openai_api_key, anthropic_api_key, google_api_key, tavily_api_key
+    """
+    updated = False
+    
+    # Update OpenAI key
+    if 'openai_api_key' in payload and payload['openai_api_key']:
+        if not validate_openai_api_key(payload['openai_api_key']):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid OpenAI API key format. Key should start with 'sk-'"
+            )
+        # Use new field if available, fall back to old field
+        if hasattr(current_user, 'encrypted_openai_key'):
+            current_user.encrypted_openai_key = encrypt_api_key(payload['openai_api_key'])
+        else:
+            current_user.encrypted_api_key = encrypt_api_key(payload['openai_api_key'])
+        updated = True
+    
+    # Update Anthropic key
+    if 'anthropic_api_key' in payload and payload['anthropic_api_key']:
+        if not validate_anthropic_api_key(payload['anthropic_api_key']):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Anthropic API key format. Key should start with 'sk-ant-'"
+            )
+        if hasattr(current_user, 'encrypted_anthropic_key'):
+            current_user.encrypted_anthropic_key = encrypt_api_key(payload['anthropic_api_key'])
+            updated = True
+    
+    # Update Google key
+    if 'google_api_key' in payload and payload['google_api_key']:
+        if not validate_google_api_key(payload['google_api_key']):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Google API key format. Key should start with 'AIza'"
+            )
+        if hasattr(current_user, 'encrypted_google_key'):
+            current_user.encrypted_google_key = encrypt_api_key(payload['google_api_key'])
+            updated = True
+    
+    # Update Tavily key
+    if 'tavily_api_key' in payload and payload['tavily_api_key']:
+        if not validate_tavily_api_key(payload['tavily_api_key']):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Tavily API key format. Key should start with 'tvly-'"
+            )
+        if hasattr(current_user, 'encrypted_tavily_key'):
+            current_user.encrypted_tavily_key = encrypt_api_key(payload['tavily_api_key'])
+            updated = True
+    
+    if not updated:
+        raise HTTPException(status_code=400, detail="No valid API keys provided to update")
+    
+    db.commit()
+    db.refresh(current_user)
+    
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "has_openai_key": bool(
+            getattr(current_user, 'encrypted_openai_key', None) or 
+            getattr(current_user, 'encrypted_api_key', None)
+        ),
+        "has_anthropic_key": bool(getattr(current_user, 'encrypted_anthropic_key', None)),
+        "has_google_key": bool(getattr(current_user, 'encrypted_google_key', None)),
+        "has_tavily_key": bool(getattr(current_user, 'encrypted_tavily_key', None))
+    }
+
+
 @router.put("/api-key", response_model=UserOut)
-def update_api_key(
-    payload: UserUpdateApiKey,
+def update_single_api_key(
+    openai_api_key: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
     Update user's OpenAI API key.
-    Allows users to change their API key after signup.
+    Kept for backward compatibility.
     """
-    # Validate new API key
-    if not validate_openai_api_key(payload.openai_api_key):
+    if not validate_openai_api_key(openai_api_key):
         raise HTTPException(
             status_code=400,
-            detail="Invalid OpenAI API key format. Key should start with 'sk-' and be at least 20 characters long."
+            detail="Invalid OpenAI API key format. Key should start with 'sk-'"
         )
     
-    # Encrypt new API key
-    try:
-        encrypted_key = encrypt_api_key(payload.openai_api_key)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to process API key")
+    encrypted_key = encrypt_api_key(openai_api_key)
     
-    # Update user's API key
-    current_user.encrypted_api_key = encrypted_key
+    # Use new field if available, fall back to old field
+    if hasattr(current_user, 'encrypted_openai_key'):
+        current_user.encrypted_openai_key = encrypted_key
+    else:
+        current_user.encrypted_api_key = encrypted_key
+    
     db.commit()
+    db.refresh(current_user)
     
     return UserOut(
         id=current_user.id,
         email=current_user.email,
-        has_api_key=True
+        has_openai_key=True,
+        has_anthropic_key=bool(getattr(current_user, 'encrypted_anthropic_key', None)),
+        has_google_key=bool(getattr(current_user, 'encrypted_google_key', None)),
+        has_tavily_key=bool(getattr(current_user, 'encrypted_tavily_key', None))
     )
 
 
-@router.delete("/api-key")
+@router.delete("/api-key/{provider}")
 def delete_api_key(
+    provider: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Remove user's API key (will fall back to system key if configured).
-    """
-    current_user.encrypted_api_key = None
+    """Remove specific provider API key"""
+    provider = provider.lower()
+    
+    if provider == 'openai':
+        if hasattr(current_user, 'encrypted_openai_key'):
+            current_user.encrypted_openai_key = None
+        else:
+            current_user.encrypted_api_key = None
+    elif provider == 'anthropic':
+        if hasattr(current_user, 'encrypted_anthropic_key'):
+            current_user.encrypted_anthropic_key = None
+    elif provider == 'google':
+        if hasattr(current_user, 'encrypted_google_key'):
+            current_user.encrypted_google_key = None
+    elif provider == 'tavily':
+        if hasattr(current_user, 'encrypted_tavily_key'):
+            current_user.encrypted_tavily_key = None
+    else:
+        raise HTTPException(status_code=400, detail="Invalid provider")
+    
     db.commit()
     
-    return {"status": "API key removed"}
+    return {"status": f"{provider.title()} API key removed"}
 
 
-from .memmachine_client import search as mm_search
+# ============================================================================
+# MEMORY/HISTORY ENDPOINTS - UPDATED FOR V2
+# ============================================================================
+
+from . import memmachine_client
 
 @router.get("/history")
 def history(user: User = Depends(get_current_user)):
     """
-    Returns a lightweight view of user's remembered items (profile + episodic).
+    Returns a lightweight view of user's remembered items (semantic + episodic).
     Frontend can render this as a sidebar or preload list.
+    
+    ✅ UPDATED FOR MEMMACHINE V2:
+    - Uses new search_memories function
+    - Searches across ALL personal threads
+    - Returns both semantic and episodic memories
     """
-    uid = str(user.id)
-    # broad query to fetch recent items
-    content = mm_search(uid, "recent uploaded documents and recent conversations", limit=20, session_id=f"sess-{uid}")
-    return {"history": content}
+    try:
+        # Search user's personal memories (across all threads)
+        results = memmachine_client.search_memories(
+            user_id=user.id,
+            query="recent documents conversations topics",
+            project_id=None,  # Personal scope
+            thread_id=None,  # All threads (cross-thread search)
+            limit=20,
+            search_semantic=True,
+            search_episodic=True
+        )
+        
+        # Format for frontend
+        history_items = []
+        
+        # Add semantic memories (documents, preferences)
+        for mem in results.get("semantic_results", []):
+            history_items.append({
+                "type": "semantic",
+                "content": mem.get("profile_content", "")[:200],
+                "metadata": mem.get("metadata", {}),
+                "score": mem.get("score", 0)
+            })
+        
+        # Add episodic memories (conversations)
+        for mem in results.get("episodic_results", []):
+            history_items.append({
+                "type": "episodic",
+                "content": mem.get("episode_content", "")[:200],
+                "metadata": mem.get("metadata", {}),
+                "score": mem.get("score", 0)
+            })
+        
+        logger.info(f"📋 History retrieved: {len(history_items)} items for user {user.id}")
+        
+        return {
+            "history": history_items,
+            "total": len(history_items),
+            "semantic_count": len(results.get("semantic_results", [])),
+            "episodic_count": len(results.get("episodic_results", []))
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ History retrieval failed: {e}")
+        return {
+            "history": [],
+            "total": 0,
+            "error": str(e)
+        }
